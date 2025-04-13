@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Visualizer: DJ Name, Shape, Floor & Horizon</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: black;
+    }
+    canvas {
+      display: block;
+    }
+    /* DJ Name styling with neon text shadow */
+    #djName {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 6vw;
+      font-family: 'Arial Black', sans-serif;
+      text-shadow: 0 0 4px currentColor, 0 0 8px currentColor;
+      pointer-events: none;
+      z-index: 50;
+    }
+  </style>
+</head>
+<body>
+  <div id="djName">BAD GAL RIRI</div>
+  <script type="module">
+    import * as THREE from 'https://esm.sh/three@0.158.0';
+    import { GUI } from 'https://cdn.jsdelivr.net/npm/dat.gui@0.7.7/build/dat.gui.module.js';
+
+    // -----------------------
+    // Parameters via GUI
+    // -----------------------
+    const parameters = {
+      shapeThreshold: 90,      // Minimum bass amplitude to trigger a shape change
+      shapeDiff: 30,           // Minimum change in bass to trigger morphing
+      morphSpeed: 0.7,         // Blend factor for shape morphing
+      cooldownFrames: 60,      // Frames between allowed shape changes
+      particlesEnabled: true,  // Toggle particle system on/off
+      particleCount: 500,      // Number of particles
+      floorY: -100,            // Y position of the floor grids (range: -500 to 0)
+      floorScrollSpeed: 1.0,   // Speed of the floor scroll
+      floorOpacity: 0.8,       // Floor grid opacity
+      floorSize: 10000,        // Size of the floor grid (range: 1000 to 20000)
+      djNameCooldown: 30,      // DJ Name visible duration (frames)
+      horizonOpacity: 1.0      // Horizon line opacity (range: 0 to 1)
+    };
+
+    // -----------------------
+    // Persistent state variables
+    // -----------------------
+    let previousBass = 0;
+    let lastGeometryIndex = 0;
+    let frameCount = 0;
+    let shapeChangeCooldown = 0;
+    // Countdown for DJ name (in frames)
+    let djNameFrameCountdown = 0;
+
+    // -----------------------
+    // Global Three.js and audio variables
+    // -----------------------
+    let scene, camera, renderer, wireframe, analyser, dataArray;
+    let particleSystem;        // Particle system
+    let floorGrids = [];       // Array holding two floor grids for seamless scrolling
+    let horizonLine;           // Horizon line object
+
+    // -----------------------
+    // Geometry options for the main shape
+    // -----------------------
+    const geometryOptions = [
+      () => new THREE.TorusKnotGeometry(1.5, 0.4, 100, 16),
+      () => new THREE.IcosahedronGeometry(2, 1),
+      () => new THREE.BoxGeometry(2, 2, 2, 4, 4, 4),
+      () => new THREE.SphereGeometry(2, 32, 32)
+    ];
+    const colorPalette = [0xff00ff, 0x00ffff, 0xffcc00, 0x00ff00, 0xff3300];
+
+    // -----------------------
+    // Particle system functions
+    // -----------------------
+    function createParticleSystem() {
+      const particleCount = parameters.particleCount;
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(particleCount * 3);
+      for (let i = 0; i < particleCount * 3; i++) {
+        positions[i] = (Math.random() - 0.5) * 100;
+      }
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.PointsMaterial({ color: 0xffffff, size: 0.2 });
+      particleSystem = new THREE.Points(geometry, material);
+      scene.add(particleSystem);
+    }
+
+    function removeParticleSystem() {
+      if (particleSystem) {
+        scene.remove(particleSystem);
+        if (particleSystem.geometry) particleSystem.geometry.dispose();
+        if (particleSystem.material) particleSystem.material.dispose();
+        particleSystem = null;
+      }
+    }
+
+    // -----------------------
+    // Floor grid creation using two grids for seamless scrolling.
+    // -----------------------
+    function createFloorGrids() {
+      floorGrids = [];  // Clear previous grids (if any)
+      const floorSize = parameters.floorSize; 
+      const floorGeometry = new THREE.PlaneGeometry(floorSize, floorSize, 50, 50);
+      const floorMaterial = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        wireframe: true,
+        transparent: true,
+        opacity: parameters.floorOpacity
+      });
+      // Create two grids and position them sequentially along the z-axis.
+      for (let i = 0; i < 2; i++) {
+        const grid = new THREE.Mesh(floorGeometry, floorMaterial.clone());
+        grid.rotation.x = -Math.PI / 2;
+        grid.position.y = parameters.floorY;
+        grid.position.z = i * -floorSize;
+        floorGrids.push(grid);
+        scene.add(grid);
+      }
+    }
+
+    // -----------------------
+    // Create the horizon line and attach it as a child of the second floor grid.
+    // The horizon spans horizontally along the top edge of the floor.
+    // -----------------------
+    function createHorizonLine() {
+      const floorSize = parameters.floorSize;
+      // Create line geometry that spans from -floorSize/2 to floorSize/2 at the front edge.
+      const points = [
+        new THREE.Vector3(-floorSize/2, 0.01, floorSize/2),
+        new THREE.Vector3(floorSize/2, 0.01, floorSize/2)
+      ];
+      const horizonGeometry = new THREE.BufferGeometry().setFromPoints(points);
+      const horizonMaterial = new THREE.LineBasicMaterial({
+        color: 0xffffff,
+        opacity: parameters.horizonOpacity,
+        transparent: true,
+        depthTest: true
+      });
+      horizonLine = new THREE.Line(horizonGeometry, horizonMaterial);
+      // Attach the horizon line to the back floor grid (index 1)
+      if (floorGrids[1]) {
+        floorGrids[1].add(horizonLine);
+      } else {
+        scene.add(horizonLine);
+      }
+    }
+
+    // -----------------------
+    // Function to recreate floor grids (and horizon line) when floorSize changes
+    // -----------------------
+    function recreateFloorGrids() {
+      floorGrids.forEach(grid => scene.remove(grid));
+      floorGrids = [];
+      createFloorGrids();
+      if (horizonLine) {
+        horizonLine.parent.remove(horizonLine);
+      }
+      createHorizonLine();
+    }
+
+    // -----------------------
+    // Initialize the dat.GUI panel
+    // -----------------------
+    function initGUI() {
+      const gui = new GUI();
+      gui.add(parameters, 'shapeThreshold', 0, 200).name('Shape Threshold');
+      gui.add(parameters, 'shapeDiff', 0, 100).name('Shape Difference');
+      gui.add(parameters, 'morphSpeed', 0.1, 1).name('Morph Speed');
+      gui.add(parameters, 'cooldownFrames', 10, 120, 1).name('Cooldown Frames');
+      gui.add(parameters, 'particlesEnabled')
+         .name('Particles Enabled')
+         .onChange((value) => {
+           if (value) {
+             if (!particleSystem) createParticleSystem();
+           } else {
+             removeParticleSystem();
+           }
+         });
+      gui.add(parameters, 'particleCount', 100, 1000, 1)
+         .name('Particle Count')
+         .onFinishChange(() => {
+           if (particleSystem) {
+             removeParticleSystem();
+             if (parameters.particlesEnabled) createParticleSystem();
+           }
+         });
+      // Floor grid GUI controls:
+      gui.add(parameters, 'floorY', -500, 0).name('Floor Y Position')
+         .onChange((value) => {
+           floorGrids.forEach(grid => grid.position.y = value);
+         });
+      gui.add(parameters, 'floorScrollSpeed', 0.1, 5).name('Floor Scroll Speed');
+      gui.add(parameters, 'floorOpacity', 0, 1).name('Floor Opacity')
+         .onChange((value) => {
+           floorGrids.forEach(grid => grid.material.opacity = value);
+         });
+      gui.add(parameters, 'floorSize', 1000, 20000, 100).name('Floor Size')
+         .onFinishChange(() => recreateFloorGrids());
+      // Expose the DJ name cooldown in the GUI:
+      gui.add(parameters, 'djNameCooldown', 0, 120, 1).name('DJ Name Cooldown (frames)');
+      // Expose the Horizon opacity in the GUI:
+      gui.add(parameters, 'horizonOpacity', 0, 1).name('Horizon Opacity').onChange((value) => {
+        if (horizonLine) {
+          horizonLine.material.opacity = value;
+        }
+      });
+    }
+
+    // -----------------------
+    // Main initialization function
+    // -----------------------
+    async function init() {
+      // Setup renderer and append canvas to document
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      // Create scene
+      scene = new THREE.Scene();
+
+      // Create two continuous floor grids and the horizon line
+      createFloorGrids();
+      createHorizonLine();
+
+      // Setup camera so it sees both the shape and the floor clearly
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+      camera.position.set(0, 5, 20);
+      camera.lookAt(0, 0, 0);
+
+      // Create initial wireframe mesh (the main shape) at the origin
+      wireframe = new THREE.Mesh(
+        geometryOptions[0](),
+        new THREE.MeshBasicMaterial({ color: colorPalette[0], wireframe: true })
+      );
+      scene.add(wireframe);
+
+      // Create particle system if enabled
+      if (parameters.particlesEnabled) {
+        createParticleSystem();
+      }
+
+      // Initialize GUI controls
+      initGUI();
+
+      // Setup audio input and analyser
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
+        source.connect(analyser);
+      } catch (err) {
+        console.error('Audio access error:', err);
+      }
+
+      animate();
+    }
+
+    // -----------------------
+    // Animation loop
+    // -----------------------
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // Get audio frequency data
+      analyser.getByteFrequencyData(dataArray);
+      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+      const bass = dataArray.slice(0, dataArray.length / 4)
+                            .reduce((a, b) => a + b, 0) / (dataArray.length / 4);
+      const treble = dataArray.slice(dataArray.length / 2)
+                              .reduce((a, b) => a + b, 0) / (dataArray.length / 2);
+
+      // Use the maximum value from the data for more responsive color changes.
+      let maxVal = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        if (dataArray[i] > maxVal) maxVal = dataArray[i];
+      }
+      const paletteIndex = Math.floor((maxVal / 255) * colorPalette.length) % colorPalette.length;
+
+      // Update main shape: large base scale (5) plus adjustment from bass
+      wireframe.scale.setScalar(5 + bass / 128);
+      wireframe.rotation.x += 0.01 + treble / 1024;
+      wireframe.rotation.y += 0.01 + bass / 1024;
+      wireframe.material.color.setHex(colorPalette[paletteIndex]);
+
+      // Shape morphing logic based on audio thresholds
+      frameCount++;
+      if (
+        shapeChangeCooldown <= 0 &&
+        bass > parameters.shapeThreshold &&
+        (bass - previousBass > parameters.shapeDiff) &&
+        frameCount > 120
+      ) {
+        let newIndex = Math.floor(Math.random() * geometryOptions.length);
+        while (newIndex === lastGeometryIndex) {
+          newIndex = Math.floor(Math.random() * geometryOptions.length);
+        }
+        lastGeometryIndex = newIndex;
+        const newGeometry = geometryOptions[newIndex]();
+        const oldGeometry = wireframe.geometry;
+        if (
+          oldGeometry.attributes.position &&
+          newGeometry.attributes.position &&
+          oldGeometry.attributes.position.count === newGeometry.attributes.position.count
+        ) {
+          for (let i = 0; i < oldGeometry.attributes.position.count; i++) {
+            oldGeometry.attributes.position.array[i] =
+              oldGeometry.attributes.position.array[i] * parameters.morphSpeed +
+              newGeometry.attributes.position.array[i] * (1 - parameters.morphSpeed);
+          }
+          oldGeometry.attributes.position.needsUpdate = true;
+        } else {
+          scene.remove(wireframe);
+          wireframe = new THREE.Mesh(
+            newGeometry,
+            new THREE.MeshBasicMaterial({ color: wireframe.material.color, wireframe: true })
+          );
+          scene.add(wireframe);
+        }
+        frameCount = 0;
+        shapeChangeCooldown = parameters.cooldownFrames;
+      }
+      if (shapeChangeCooldown > 0) shapeChangeCooldown--;
+      previousBass = bass;
+
+      // DJ Name neon cycling with a cooldown controlled via the GUI:
+      const djText = document.getElementById("djName");
+      const hue = (performance.now() / 10) % 360;
+      djText.style.color = `hsl(${hue}, 100%, 50%)`;
+      const beatStrength = bass / 255;
+      const beatThreshold = 0.4;
+      if (beatStrength > beatThreshold) {
+        djNameFrameCountdown = parameters.djNameCooldown; // Reset countdown using GUI value
+      } else {
+        if (djNameFrameCountdown > 0) djNameFrameCountdown--;
+      }
+      djText.style.opacity = djNameFrameCountdown > 0 ? 1 : 0;
+
+      // Animate the continuous floor grids to scroll forward:
+      const floorSize = parameters.floorSize;
+      floorGrids.forEach(grid => {
+        grid.position.z += parameters.floorScrollSpeed;
+        if (grid.position.z > floorSize) {
+          grid.position.z -= 2 * floorSize;
+        }
+      });
+
+      // Update particle system attributes if enabled:
+      if (parameters.particlesEnabled && particleSystem) {
+        const sizeFactor = 1 + bass / 128;
+        particleSystem.material.size = 0.2 * sizeFactor;
+        particleSystem.material.color.setHex(colorPalette[paletteIndex]);
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------
+    // Handle window resizing
+    // -----------------------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    init();
+  </script>
+</body>
+</html>
